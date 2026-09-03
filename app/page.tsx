@@ -56,16 +56,10 @@ interface ScanResult {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  MOCK INTELLIGENCE ENGINE                                                   */
-/*  Swap to a FastAPI backend by setting NEXT_PUBLIC_API_URL.                  */
-/*                                                                            */
-/*  const base = process.env.NEXT_PUBLIC_API_URL                              */
-/*  if (base) {                                                               */
-/*    const fd = new FormData(); fd.append("file", file)                      */
-/*    const res = await fetch(`${base}/scan`, { method: "POST", body: fd })   */
-/*    return (await res.json()) as ScanResult                                 */
-/*  }                                                                         */
+/*  BACKEND INTEGRATION & CONFIGURATION                                        */
 /* -------------------------------------------------------------------------- */
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
 const SAMPLE_TEXT = `EXECUTIVE RESUME — CONFIDENTIAL
 
@@ -228,7 +222,6 @@ const SAMPLE_SIGNALS: Signal[] = [
 ]
 
 function pseudoHash(seed: string): string {
-  // Deterministic, display-only SHA-256-style fingerprint for the demo.
   let h = 0x811c9dc5
   for (let i = 0; i < seed.length; i++) {
     h ^= seed.charCodeAt(i)
@@ -244,29 +237,199 @@ function pseudoHash(seed: string): string {
   return out
 }
 
-async function scanDocument(file: { name: string; size: number; text: string }): Promise<ScanResult> {
-  // MOCK MODE. Replace with POST ${NEXT_PUBLIC_API_URL}/scan (see notes above).
+function mapEntityCategory(type: string): Category {
+  const t = (type || "").toUpperCase()
+  if (["PERSON", "PERSON_NAME", "INDIVIDUAL", "NAME"].includes(t)) return "Identity"
+  if (["EMAIL", "PHONE", "PHONE_NUMBER", "MOBILE"].includes(t)) return "Contact"
+  if (["ADDRESS", "LOCATION", "STREET_ADDRESS"].includes(t)) return "Location"
+  if (["PAN", "AADHAAR", "FINANCIAL_ID", "CREDIT_CARD", "BANK_ACCOUNT", "SSN", "FINANCIAL"].includes(t)) return "Financial"
+  return "Other"
+}
+
+function mapEntitySeverity(risk: string): Severity {
+  const r = (risk || "MEDIUM").toUpperCase()
+  if (["CRITICAL", "HIGH", "MEDIUM", "LOW"].includes(r)) {
+    return r as Severity
+  }
+  return "MEDIUM"
+}
+
+function generateTransforms(type: string, val: string): Record<Mode, string> {
+  const t = (type || "PII").toUpperCase()
+
+  // 1. Redact
+  let redact = `[${t} REDACTED]`
+  if (t === "PERSON_NAME" || t === "PERSON") redact = "[PERSON REDACTED]"
+  else if (t === "EMAIL") redact = "[EMAIL REDACTED]"
+  else if (t === "PHONE") redact = "[PHONE REDACTED]"
+  else if (t === "AADHAAR") redact = "[AADHAAR REDACTED]"
+  else if (t === "PAN") redact = "[PAN REDACTED]"
+  else if (t === "CREDENTIAL" || t === "PASSWORD") redact = "[CREDENTIAL REDACTED]"
+  else if (t === "FINANCIAL_ID" || t === "CREDIT_CARD") redact = "[FINANCIAL REDACTED]"
+
+  // 2. Mask
+  let mask = val
+  if (t === "EMAIL" && val.includes("@")) {
+    const [user, domain] = val.split("@")
+    mask = user.length > 1 ? `${user[0]}***@${domain}` : `***@${domain}`
+  } else if (t.includes("PHONE") || t === "AADHAAR" || t === "PAN" || t.includes("CARD") || t.includes("FINANCIAL")) {
+    const digits = val.replace(/\D/g, "")
+    if (digits.length >= 4) {
+      mask = "*".repeat(Math.max(0, val.length - 4)) + val.slice(-4)
+    } else {
+      mask = "*".repeat(val.length)
+    }
+  } else if (t.includes("PERSON") || t.includes("NAME")) {
+    mask = val
+      .split(" ")
+      .map((w) => (w.length > 0 ? `${w[0]}***` : w))
+      .join(" ")
+  } else {
+    mask = val.length > 2 ? `${val[0]}***${val[val.length - 1]}` : "***"
+  }
+
+  // 3. Anonymize
+  let anonymize = `[ANON_${t}]`
+  if (t.includes("PERSON") || t.includes("NAME")) anonymize = "Alex Morgan"
+  else if (t === "EMAIL") anonymize = "user1@privacylens.internal"
+  else if (t.includes("PHONE")) anonymize = "+1-555-0101"
+  else if (t === "AADHAAR") anonymize = "9000 0000 0000"
+  else if (t === "PAN") anonymize = "ABCDE9999Z"
+  else if (t === "ADDRESS" || t === "LOCATION") anonymize = "45 Privacy Way, Suite 100"
+
+  return { REDACT: redact, MASK: mask, ANONYMIZE: anonymize }
+}
+
+async function scanDocument(file: File, purpose?: string): Promise<ScanResult> {
+  const formData = new FormData()
+  formData.append("file", file)
+  if (purpose) {
+    formData.append("intended_purpose", purpose)
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${API_BASE}/scan`, {
+      method: "POST",
+      body: formData,
+    })
+  } catch (err: any) {
+    throw new Error(`Failed to connect to backend at ${API_BASE}. Make sure the FastAPI backend is running.`)
+  }
+
+  if (!res.ok) {
+    let errMsg = `Backend scan failed with status ${res.status}`
+    try {
+      const errJson = await res.json()
+      if (errJson.detail) errMsg = errJson.detail
+    } catch {
+      // ignore
+    }
+    throw new Error(errMsg)
+  }
+
+  const data = await res.json()
   const mb = (file.size / (1024 * 1024)).toFixed(1)
+
+  // Read text if available for client-side preview pane
+  let extractedText = ""
+  if (file.type.startsWith("text/") || file.name.endsWith(".txt")) {
+    try {
+      extractedText = await file.text()
+    } catch {
+      extractedText = ""
+    }
+  }
+
+  const rawEntities: any[] = data.entities || []
+  const signals: Signal[] = rawEntities.map((ent: any, idx: number) => {
+    const rawType = String(ent.type || "PII")
+    const rawVal = String(ent.value || "")
+    const rawRisk = String(ent.risk || "MEDIUM")
+    const category = mapEntityCategory(rawType)
+    const severity = mapEntitySeverity(rawRisk)
+    const transforms = generateTransforms(rawType, rawVal)
+
+    let recommended: Mode = "REDACT"
+    if (ent.recommended_action) {
+      const recUpper = String(ent.recommended_action).toUpperCase()
+      if (recUpper.includes("MASK")) recommended = "MASK"
+      else if (recUpper.includes("ANON") || recUpper.includes("PSEUDO")) recommended = "ANONYMIZE"
+      else recommended = "REDACT"
+    } else {
+      if (severity === "CRITICAL") recommended = "REDACT"
+      else if (severity === "HIGH") recommended = "MASK"
+      else recommended = "ANONYMIZE"
+    }
+
+    const why = ent.reason || `${rawType} constitutes sensitive personally identifiable information.`
+    const exposure = [
+      `Detected via ${ent.source || "PrivacyLens Engine"}`,
+      `Assessed with ${severity} privacy exposure risk`,
+      ent.recommended_action ? `Action: ${ent.recommended_action}` : `Recommended: ${recommended}`,
+    ]
+
+    let context = `…${rawVal}…`
+    if (extractedText && extractedText.includes(rawVal)) {
+      const pos = extractedText.indexOf(rawVal)
+      const start = Math.max(0, pos - 30)
+      const end = Math.min(extractedText.length, pos + rawVal.length + 30)
+      context = `…${extractedText.slice(start, end).replace(/\n/g, " ")}…`
+    }
+
+    return {
+      index: idx + 1,
+      type: rawType,
+      value: rawVal,
+      category,
+      severity,
+      why,
+      exposure,
+      recommended,
+      context,
+      transforms,
+    }
+  })
+
   return {
-    scanId: "scan_" + pseudoHash(file.name + file.size).slice(0, 12),
+    scanId: data.scan_id || `scan_${pseudoHash(file.name + file.size).slice(0, 12)}`,
     fileName: file.name,
     fileSize: `${mb} MB`,
-    hash: pseudoHash(file.text + file.name),
+    hash: pseudoHash(file.name + file.size),
+    score: typeof data.risk_score === "number" ? data.risk_score : 0,
+    status: `${data.risk_level || "LOW"} EXPOSURE`,
+    narrative: data.summary || "PrivacyLens scan completed successfully.",
+    signals,
+    originalText:
+      extractedText ||
+      (signals.length
+        ? `[Binary / Formatted Document: ${file.name}]\n\nDetected Sensitive Signals:\n${signals
+            .map((s) => `• [${s.type}] ${s.value} (${s.severity})`)
+            .join("\n")}`
+        : `[Document: ${file.name}]`),
+  }
+}
+
+function getSampleScanResult(): ScanResult {
+  return {
+    scanId: "scan_sample_" + pseudoHash(SAMPLE_TEXT).slice(0, 10),
+    fileName: "executive-resume.pdf",
+    fileSize: "2.4 MB",
+    hash: pseudoHash(SAMPLE_TEXT + "executive-resume.pdf"),
     score: 82,
     status: "CRITICAL EXPOSURE",
-    narrative:
-      "Your document contains information that could meaningfully increase privacy exposure if shared.",
+    narrative: "Your document contains information that could meaningfully increase privacy exposure if shared.",
     signals: SAMPLE_SIGNALS,
-    originalText: file.text,
+    originalText: SAMPLE_TEXT,
   }
 }
 
 function protectDocument(scan: ScanResult, mode: Mode): string {
-  // MOCK MODE. Replace with POST ${NEXT_PUBLIC_API_URL}/protect
-  //   body: { scan_id: scan.scanId, mode }
   let text = scan.originalText
   for (const s of scan.signals) {
-    text = text.split(s.value).join(s.transforms[mode])
+    if (s.value && s.transforms && s.transforms[mode]) {
+      text = text.split(s.value).join(s.transforms[mode])
+    }
   }
   return text
 }
@@ -344,34 +507,48 @@ export default function Page() {
     setView("document")
   }, [])
 
-  const runScan = useCallback(async (file: { name: string; size: number; text: string }) => {
-    setError(null)
-    setPhase("scanning")
-    setProgress(0)
-    setStepIndex(0)
-    setScanMeta({ name: file.name, size: (file.size / (1024 * 1024)).toFixed(1) + " MB" })
+  const runScan = useCallback(
+    async (fileInput: File | { isSample: true; name: string; size: number }) => {
+      setError(null)
+      setPhase("scanning")
+      setProgress(0)
+      setStepIndex(0)
+      const mb = ((fileInput.size || 0) / (1024 * 1024)).toFixed(1)
+      setScanMeta({ name: fileInput.name, size: `${mb} MB` })
 
-    const totalSteps = 5
-    const stepTimers: ReturnType<typeof setTimeout>[] = []
-    for (let i = 1; i < totalSteps; i++) {
-      stepTimers.push(setTimeout(() => setStepIndex(i), i * 520))
-    }
-    const progTimer = setInterval(() => {
-      setProgress((p) => Math.min(100, p + Math.random() * 9 + 3))
-    }, 120)
+      const totalSteps = 5
+      const stepTimers: ReturnType<typeof setTimeout>[] = []
+      for (let i = 1; i < totalSteps; i++) {
+        stepTimers.push(setTimeout(() => setStepIndex(i), i * 350))
+      }
+      const progTimer = setInterval(() => {
+        setProgress((p) => Math.min(92, p + Math.random() * 10 + 3))
+      }, 100)
 
-    const result = await scanDocument(file)
+      try {
+        let result: ScanResult
+        if ("isSample" in fileInput && fileInput.isSample) {
+          result = getSampleScanResult()
+        } else {
+          result = await scanDocument(fileInput as File)
+        }
 
-    setTimeout(() => {
-      clearInterval(progTimer)
-      stepTimers.forEach(clearTimeout)
-      setProgress(100)
-      setStepIndex(totalSteps - 1)
-      setScan(result)
-      setMode(result.signals[0]?.recommended ?? "REDACT")
-      setTimeout(() => setPhase("analysis"), 420)
-    }, 2900)
-  }, [])
+        clearInterval(progTimer)
+        stepTimers.forEach(clearTimeout)
+        setProgress(100)
+        setStepIndex(totalSteps - 1)
+        setScan(result)
+        setMode(result.signals[0]?.recommended ?? "REDACT")
+        setTimeout(() => setPhase("analysis"), 350)
+      } catch (err: any) {
+        clearInterval(progTimer)
+        stepTimers.forEach(clearTimeout)
+        setPhase("idle")
+        setError(err.message || "Failed to scan document.")
+      }
+    },
+    [],
+  )
 
   const validateAndScan = useCallback(
     (file: File) => {
@@ -388,14 +565,13 @@ export default function Page() {
         setError("That document is larger than 10 MB. Please choose a smaller file.")
         return
       }
-      // For the demo we analyze against the sample corpus regardless of contents.
-      runScan({ name: file.name, size: file.size, text: SAMPLE_TEXT })
+      runScan(file)
     },
     [runScan],
   )
 
   const runSample = useCallback(() => {
-    runScan({ name: "executive-resume.pdf", size: Math.round(2.4 * 1024 * 1024), text: SAMPLE_TEXT })
+    runScan({ isSample: true, name: "executive-resume.pdf", size: Math.round(2.4 * 1024 * 1024) })
   }, [runScan])
 
   const runProtect = useCallback(() => {
@@ -404,18 +580,18 @@ export default function Page() {
     setProgress(0)
     setStepIndex(0)
     const stepTimers: ReturnType<typeof setTimeout>[] = []
-    for (let i = 1; i < 3; i++) stepTimers.push(setTimeout(() => setStepIndex(i), i * 640))
+    for (let i = 1; i < 3; i++) stepTimers.push(setTimeout(() => setStepIndex(i), i * 500))
     const progTimer = setInterval(() => {
-      setProgress((p) => Math.min(100, p + Math.random() * 10 + 4))
-    }, 130)
+      setProgress((p) => Math.min(95, p + Math.random() * 12 + 4))
+    }, 100)
     setTimeout(() => {
       clearInterval(progTimer)
       stepTimers.forEach(clearTimeout)
       setProgress(100)
       setStepIndex(2)
       setView("document")
-      setTimeout(() => setPhase("protected"), 420)
-    }, 2200)
+      setTimeout(() => setPhase("protected"), 350)
+    }, 1600)
   }, [scan])
 
   const filteredSignals = useMemo(() => {
@@ -431,18 +607,68 @@ export default function Page() {
 
   const protectedText = useMemo(() => (scan ? protectDocument(scan, mode) : ""), [scan, mode])
 
-  const download = useCallback(() => {
+  const download = useCallback(async () => {
     if (!scan) return
-    const header = `# PrivacyLens — Protected Document\n# Method: ${mode}\n# Signals neutralized: ${scan.signals.length}\n# Source hash: ${scan.hash}\n\n`
-    const blob = new Blob([header + protectedText], { type: "text/plain;charset=utf-8" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `protected-${scan.fileName.replace(/\.[^.]+$/, "")}.txt`
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+
+    // Sample demo document client-side download fallback
+    if (scan.scanId.startsWith("scan_sample_") || !scan.scanId.includes("-")) {
+      const header = `# PrivacyLens — Protected Document\n# Method: ${mode}\n# Signals neutralized: ${scan.signals.length}\n# Source hash: ${scan.hash}\n\n`
+      const blob = new Blob([header + protectedText], { type: "text/plain;charset=utf-8" })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `protected-${scan.fileName.replace(/\.[^.]+$/, "")}.txt`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      return
+    }
+
+    // Real backend download from POST /protect
+    try {
+      const res = await fetch(`${API_BASE}/protect`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          scan_id: scan.scanId,
+          mode: mode,
+        }),
+      })
+
+      if (!res.ok) {
+        let errDetail = "Protection download failed."
+        try {
+          const errJson = await res.json()
+          if (errJson.detail) errDetail = errJson.detail
+        } catch {
+          // ignore
+        }
+        setError(`Protection download error: ${errDetail}`)
+        return
+      }
+
+      const disposition = res.headers.get("Content-Disposition") || ""
+      let filename = `protected-${scan.fileName}`
+      const filenameMatch = disposition.match(/filename="?([^";]+)"?/)
+      if (filenameMatch && filenameMatch[1]) {
+        filename = filenameMatch[1]
+      }
+
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (err: any) {
+      setError(`Failed to download protected file: ${err.message || String(err)}`)
+    }
   }, [scan, mode, protectedText])
 
   return (
