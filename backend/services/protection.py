@@ -604,7 +604,7 @@ def protect_document(
         return protected_bytes, output_filename, mime_type
 
     # Usage A: string text passed
-    original_text = str(target)
+    original_text = str(target if target is not None else "")
     protector = DocumentProtector()
     result = protector.protect(original_text, entities, mode=mode)
     return result["protected_text"]
