@@ -7,15 +7,34 @@ Provides three protection modes for sensitive PII in documents:
 3. ANONYMIZE: Replaces sensitive values with consistent synthetic surrogate tokens (e.g. [PERSON_1])
 """
 
+import io
+import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import pymupdf
+import docx
 
 from .privacy_score import _extract_field
+
+VALID_MODES = {"REDACT", "MASK", "ANONYMIZE"}
+
+MIME_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "txt": "text/plain; charset=utf-8",
+}
+
+
+class ProtectionError(Exception):
+    """Raised when document protection or sanitization fails."""
+    pass
+
 
 # Canonical category mapping for anonymization tokens and redact tags
 CANONICAL_TYPES: Dict[str, str] = {
     "NAME": "PERSON",
     "PERSON": "PERSON",
+    "PERSON_NAME": "PERSON",
     "INDIVIDUAL": "PERSON",
     "FULL_NAME": "PERSON",
     "FIRST_NAME": "PERSON",
@@ -32,6 +51,13 @@ CANONICAL_TYPES: Dict[str, str] = {
     "DEBIT_CARD": "CREDIT_CARD",
     "SSN": "SSN",
     "SOCIAL_SECURITY_NUMBER": "SSN",
+    "AADHAAR": "AADHAAR",
+    "PAN": "PAN",
+    "FINANCIAL_ID": "CREDIT_CARD",
+    "CREDENTIAL": "PASSWORD",
+    "PASSWORD": "PASSWORD",
+    "API_KEY": "SECRET_KEY",
+    "SECRET_KEY": "SECRET_KEY",
     "ADDRESS": "ADDRESS",
     "STREET_ADDRESS": "ADDRESS",
     "LOCATION": "ADDRESS",
@@ -43,6 +69,8 @@ CANONICAL_TYPES: Dict[str, str] = {
     "ORGANIZATION": "ORGANIZATION",
     "COMPANY": "ORGANIZATION",
     "IP_ADDRESS": "IP_ADDRESS",
+    "MEDICAL": "MEDICAL_RECORD",
+    "MEDICAL_RECORD": "MEDICAL_RECORD",
 }
 
 
@@ -85,7 +113,6 @@ def _mask_phone(text: str) -> str:
     """
     digits = [c for c in text if c.isdigit()]
     if len(digits) <= 4:
-        # If 4 or fewer digits, mask all except the very last digit
         kept = 1 if len(digits) > 1 else 0
     else:
         kept = 4
@@ -125,6 +152,15 @@ def _mask_ssn(text: str) -> str:
     return _mask_phone(text)
 
 
+def _mask_aadhaar(text: str) -> str:
+    """
+    Masks 12-digit Indian Aadhaar numbers:
+    1234 5678 9012 -> **** **** 9012
+    123456789012 -> ********9012
+    """
+    return _mask_phone(text)
+
+
 def _mask_name(text: str) -> str:
     """
     Masks names by retaining initial letter per word:
@@ -150,10 +186,8 @@ def _mask_address(text: str) -> str:
     Masks address street numbers and details:
     123 Main St -> *** Main St
     """
-    # Replace leading street numbers with ***
     masked = re.sub(r"^\d+", "***", text.strip())
     if masked == text.strip():
-        # Mask internal digit clusters
         masked = re.sub(r"\d+", "***", masked)
     return masked
 
@@ -174,7 +208,7 @@ def _mask_generic(text: str) -> str:
         return stripped[0] + "***" + stripped[-1]
 
 
-def get_masked_value(text: str, entity_type: Optional[str]) -> str:
+def get_masked_value(text: str, entity_type: Optional[str] = None) -> str:
     """Routes entity text to appropriate masking handler based on entity type."""
     canonical = _get_canonical_type(entity_type)
 
@@ -182,9 +216,9 @@ def get_masked_value(text: str, entity_type: Optional[str]) -> str:
         return _mask_email(text)
     elif canonical in ("PHONE", "MOBILE"):
         return _mask_phone(text)
-    elif canonical == "CREDIT_CARD":
+    elif canonical in ("CREDIT_CARD", "FINANCIAL_ID", "PAN"):
         return _mask_credit_card(text)
-    elif canonical == "SSN":
+    elif canonical in ("SSN", "AADHAAR"):
         return _mask_ssn(text)
     elif canonical == "PERSON":
         return _mask_name(text)
@@ -202,23 +236,22 @@ def _extract_and_resolve_spans(
     original_text: str,
     entities: List[Any],
 ) -> List[Dict[str, Any]]:
-    """
-    Prepares, validates, and de-duplicates entity spans.
-    Resolves overlaps gracefully by prioritizing larger or earlier spans.
-    """
+    """Extracts, validates, and sorts non-overlapping spans from detected entities."""
+    if not original_text or not entities:
+        return []
+
     doc_len = len(original_text)
     candidate_spans: List[Dict[str, Any]] = []
 
     for entity in entities:
+        start_val = _extract_field(entity, "start", "start_offset", "start_pos", "begin")
+        end_val = _extract_field(entity, "end", "end_offset", "end_pos")
         text_val = _extract_field(entity, "text", "value", "content", "raw")
         raw_type = _extract_field(entity, "entity_type", "type", "label", "category") or "PII"
-        start_val = _extract_field(entity, "start", "start_char", "start_offset", "start_idx")
-        end_val = _extract_field(entity, "end", "end_char", "end_offset", "end_idx")
 
-        if text_val is None and (start_val is None or end_val is None):
+        if start_val is None and end_val is None and not text_val:
             continue
 
-        # Convert offsets if present
         start_int: Optional[int] = None
         end_int: Optional[int] = None
         try:
@@ -230,10 +263,8 @@ def _extract_and_resolve_spans(
             start_int = None
             end_int = None
 
-        # If offsets are missing or invalid, search for text occurrence in document
         if start_int is None or end_int is None or start_int < 0 or end_int > doc_len or start_int >= end_int:
             if text_val and isinstance(text_val, str) and text_val in original_text:
-                # Find all occurrences of text_val in document
                 search_idx = 0
                 while search_idx < doc_len:
                     found_idx = original_text.find(text_val, search_idx)
@@ -249,7 +280,6 @@ def _extract_and_resolve_spans(
                     search_idx = found_idx + len(text_val)
             continue
 
-        # Validate that the slice matches or extract from text
         span_text = original_text[start_int:end_int]
         extracted_text = str(text_val) if text_val is not None else span_text
 
@@ -264,15 +294,11 @@ def _extract_and_resolve_spans(
     if not candidate_spans:
         return []
 
-    # Sort candidates by:
-    # 1. start offset ascending
-    # 2. span length descending (prioritize longer matching span in overlaps)
     sorted_candidates = sorted(
         candidate_spans,
         key=lambda s: (s["start"], -(s["end"] - s["start"])),
     )
 
-    # Filter non-overlapping spans
     resolved: List[Dict[str, Any]] = []
     last_end = -1
 
@@ -283,10 +309,6 @@ def _extract_and_resolve_spans(
 
     return resolved
 
-
-# ==============================================================================
-# MAIN PROTECTION ENGINES
-# ==============================================================================
 
 class DocumentProtector:
     """
@@ -299,10 +321,7 @@ class DocumentProtector:
         self.anonymize_mapping: Dict[Tuple[str, str], str] = {}
 
     def get_anonymized_placeholder(self, text: str, entity_type: str) -> str:
-        """
-        Returns a consistent anonymized placeholder for a given entity value and type.
-        Same sensitive value always receives the identical placeholder during one operation.
-        """
+        """Returns a consistent anonymized placeholder for a given entity value and type."""
         canonical = _get_canonical_type(entity_type)
         lookup_key = (canonical, text.strip().lower())
 
@@ -322,10 +341,7 @@ class DocumentProtector:
         entities: Optional[List[Any]] = None,
         mode: Union[str, Any] = "redact",
     ) -> Dict[str, Any]:
-        """
-        Protects document text using the specified mode:
-        'redact', 'mask', or 'anonymize'.
-        """
+        """Protects document text using the specified mode: 'redact', 'mask', or 'anonymize'."""
         if not original_text:
             return {
                 "protected_text": "",
@@ -346,7 +362,6 @@ class DocumentProtector:
         if hasattr(mode, "value"):
             mode_str = str(mode.value).strip().lower()
 
-        # Step 1: Extract, validate, and resolve non-overlapping spans
         resolved_spans = _extract_and_resolve_spans(original_text, entities)
         if not resolved_spans:
             return {
@@ -356,7 +371,6 @@ class DocumentProtector:
                 "anonymization_mapping": {},
             }
 
-        # Step 2: Determine replacements for each span (in document order)
         replacement_actions: List[Dict[str, Any]] = []
         for span in resolved_spans:
             entity_text = span["text"]
@@ -367,7 +381,6 @@ class DocumentProtector:
             elif mode_str == "anonymize":
                 replacement = self.get_anonymized_placeholder(entity_text, entity_type)
             else:
-                # Default: REDACT
                 canonical = _get_canonical_type(entity_type)
                 if canonical == "PII":
                     replacement = "[REDACTED]"
@@ -380,8 +393,6 @@ class DocumentProtector:
                 "replacement": replacement,
             })
 
-        # Step 3: Perform safe replacement from end to beginning
-        # Sorting by start DESCENDING guarantees offsets for preceding text remain valid!
         protected_text = original_text
         for action in sorted(replacement_actions, key=lambda a: a["start"], reverse=True):
             start = action["start"]
@@ -389,7 +400,6 @@ class DocumentProtector:
             rep = action["replacement"]
             protected_text = protected_text[:start] + rep + protected_text[end:]
 
-        # Friendly mapping format: "John Smith" -> "[PERSON_1]"
         exportable_mapping = {
             k[1]: v for k, v in self.anonymize_mapping.items()
         }
@@ -403,25 +413,198 @@ class DocumentProtector:
 
 
 # ==============================================================================
-# CONVENIENCE STANDALONE FUNCTIONS FOR PERSON 1
+# FILE-LEVEL (PDF, DOCX, TXT) PROTECTION FOR FASTAPI / DOWNLOADS
+# ==============================================================================
+
+def _build_replacement_map(
+    entities: List[Dict[str, Any]],
+    mode: str
+) -> Dict[str, str]:
+    """Build replacement dictionary of entity value -> protected token for file sanitization."""
+    replacements: Dict[str, str] = {}
+    protector = DocumentProtector()
+    mode_lower = mode.strip().lower()
+
+    sorted_entities = sorted(
+        entities,
+        key=lambda x: len(str(_extract_field(x, "value", "text", default=""))),
+        reverse=True,
+    )
+
+    for entity in sorted_entities:
+        orig_val = str(_extract_field(entity, "value", "text", default="")).strip()
+        if not orig_val or orig_val in replacements:
+            continue
+
+        entity_type = str(_extract_field(entity, "type", "entity_type", default="PII")).upper()
+
+        if mode_lower == "redact":
+            canonical = _get_canonical_type(entity_type)
+            replacement = f"[REDACTED: {canonical}]"
+        elif mode_lower == "mask":
+            replacement = get_masked_value(orig_val, entity_type)
+        elif mode_lower == "anonymize":
+            canonical = _get_canonical_type(entity_type)
+            if canonical == "PERSON":
+                replacement = protector.get_anonymized_placeholder(orig_val, "PERSON")
+            elif canonical == "EMAIL":
+                counter = protector.type_counters.get("EMAIL", 0) + 1
+                protector.type_counters["EMAIL"] = counter
+                replacement = f"user{counter}@privacylens.internal"
+            elif canonical == "PHONE":
+                counter = protector.type_counters.get("PHONE", 0) + 1
+                protector.type_counters["PHONE"] = counter
+                replacement = f"+1-555-01{counter:02d}"
+            else:
+                replacement = protector.get_anonymized_placeholder(orig_val, canonical)
+        else:
+            replacement = f"[PROTECTED_{entity_type}]"
+
+        replacements[orig_val] = replacement
+
+    return replacements
+
+
+def protect_txt(raw_bytes: bytes, replacement_map: Dict[str, str]) -> bytes:
+    """Sanitize TXT document."""
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            text = raw_bytes.decode(encoding)
+            for orig_val, rep in replacement_map.items():
+                if orig_val in text:
+                    text = text.replace(orig_val, rep)
+            return text.encode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    raise ProtectionError("Failed to decode text document for protection.")
+
+
+def protect_docx(raw_bytes: bytes, replacement_map: Dict[str, str]) -> bytes:
+    """Sanitize DOCX document preserving format."""
+    try:
+        doc = docx.Document(io.BytesIO(raw_bytes))
+
+        for p in doc.paragraphs:
+            for orig_val, rep in replacement_map.items():
+                if orig_val in p.text:
+                    p.text = p.text.replace(orig_val, rep)
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for orig_val, rep in replacement_map.items():
+                        if orig_val in cell.text:
+                            cell.text = cell.text.replace(orig_val, rep)
+
+        output_stream = io.BytesIO()
+        doc.save(output_stream)
+        return output_stream.getvalue()
+    except Exception as e:
+        raise ProtectionError(f"Failed to protect DOCX document: {str(e)}")
+
+
+def protect_pdf(
+    raw_bytes: bytes,
+    replacement_map: Dict[str, str],
+    mode: str
+) -> bytes:
+    """Sanitize PDF document using PyMuPDF native redactions."""
+    try:
+        doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
+
+        for page in doc:
+            for orig_val, rep in replacement_map.items():
+                if not orig_val:
+                    continue
+                rects = page.search_for(orig_val)
+                for rect in rects:
+                    if mode.upper() == "REDACT":
+                        page.add_redact_annot(
+                            rect,
+                            text=rep,
+                            fontsize=9,
+                            fill=(0, 0, 0),
+                            text_color=(1, 1, 1),
+                        )
+                    else:
+                        page.add_redact_annot(
+                            rect,
+                            text=rep,
+                            fontsize=9,
+                            fill=(0.95, 0.95, 0.95),
+                            text_color=(0.1, 0.1, 0.1),
+                        )
+
+            page.apply_redactions()
+
+        output_bytes = doc.tobytes(deflate=True, clean=True)
+        doc.close()
+        return output_bytes
+    except Exception as e:
+        if 'doc' in locals() and not doc.is_closed:
+            doc.close()
+        raise ProtectionError(f"Failed to protect PDF document: {str(e)}")
+
+
+# ==============================================================================
+# UNIFIED PROTECT_DOCUMENT DISPATCHER
 # ==============================================================================
 
 def protect_document(
-    original_text: str,
+    target: Optional[Union[str, Dict[str, Any]]] = None,
     entities: Optional[List[Any]] = None,
     mode: str = "redact",
-) -> str:
+    scan_data: Optional[Dict[str, Any]] = None,
+) -> Union[str, Tuple[bytes, str, str]]:
     """
-    Main protection interface.
+    Main protection interface supporting both string text protection and file-level scan protection.
 
-    Args:
-        original_text: The complete original document string.
-        entities: List of detected entity dictionaries or objects.
-        mode: Protection mode ('redact', 'mask', or 'anonymize').
+    Usage A (String text):
+        protected_str = protect_document("Email: john@example.com", entities=[...], mode="redact")
 
-    Returns:
-        The protected document string with sensitive data transformed.
+    Usage B (File scan dict):
+        protected_bytes, filename, mime_type = protect_document(scan_data=scan_data_dict, mode="REDACT")
     """
+    # Usage B: scan_data dictionary passed
+    actual_scan_data = scan_data if scan_data is not None else (target if isinstance(target, dict) else None)
+    if actual_scan_data is not None:
+        scan_data_obj = actual_scan_data
+        mode_upper = mode.upper().strip()
+        if mode_upper not in VALID_MODES:
+            raise ProtectionError(f"Invalid protection mode '{mode}'. Must be REDACT, MASK, or ANONYMIZE.")
+
+        scan_entities = scan_data_obj.get("entities", [])
+        file_type = scan_data_obj.get("file_type", "txt").lower()
+        filename = scan_data_obj.get("filename", f"document.{file_type}")
+        raw_bytes = scan_data_obj.get("raw_bytes")
+        doc_text = scan_data_obj.get("text", "")
+
+        if not raw_bytes and doc_text:
+            raw_bytes = doc_text.encode("utf-8")
+            file_type = "txt"
+
+        if not raw_bytes:
+            raise ProtectionError("No document data available for protection.")
+
+        replacement_map = _build_replacement_map(scan_entities, mode_upper)
+
+        base_name, ext = os.path.splitext(filename)
+        output_filename = f"{base_name}_{mode_upper.lower()}{ext if ext else f'.{file_type}'}"
+        mime_type = MIME_TYPES.get(file_type, "application/octet-stream")
+
+        if file_type == "pdf":
+            protected_bytes = protect_pdf(raw_bytes, replacement_map, mode_upper)
+        elif file_type == "docx":
+            protected_bytes = protect_docx(raw_bytes, replacement_map)
+        elif file_type == "txt":
+            protected_bytes = protect_txt(raw_bytes, replacement_map)
+        else:
+            raise ProtectionError(f"Unsupported file type for protection: {file_type}")
+
+        return protected_bytes, output_filename, mime_type
+
+    # Usage A: string text passed
+    original_text = str(target)
     protector = DocumentProtector()
     result = protector.protect(original_text, entities, mode=mode)
     return result["protected_text"]
@@ -432,7 +615,7 @@ def redact_text(
     entities: Optional[List[Any]] = None,
 ) -> str:
     """Convenience wrapper for REDACT mode."""
-    return protect_document(original_text, entities, mode="redact")
+    return str(protect_document(original_text, entities, mode="redact"))
 
 
 def mask_text(
@@ -440,7 +623,7 @@ def mask_text(
     entities: Optional[List[Any]] = None,
 ) -> str:
     """Convenience wrapper for MASK mode."""
-    return protect_document(original_text, entities, mode="mask")
+    return str(protect_document(original_text, entities, mode="mask"))
 
 
 def anonymize_text(
@@ -448,4 +631,4 @@ def anonymize_text(
     entities: Optional[List[Any]] = None,
 ) -> str:
     """Convenience wrapper for ANONYMIZE mode."""
-    return protect_document(original_text, entities, mode="anonymize")
+    return str(protect_document(original_text, entities, mode="anonymize"))
