@@ -223,7 +223,7 @@ def run_live_verification():
         anon_text = bytes_anon.decode("utf-8")
 
         protect_success = (
-            status_redact == 200 and "[REDACTED_EMAIL]" in redact_text and "alexander.wright@enterprise.org" not in redact_text and
+            status_redact == 200 and "[REDACTED: EMAIL]" in redact_text and "alexander.wright@enterprise.org" not in redact_text and
             status_mask == 200 and "alexander.wright@enterprise.org" not in mask_text and
             status_anon == 200 and "@privacylens.internal" in anon_text
         )
